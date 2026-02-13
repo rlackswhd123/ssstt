@@ -1,6 +1,8 @@
 import io
 import os
 import queue
+import shutil
+import subprocess
 import threading
 import time
 import uuid
@@ -19,6 +21,11 @@ try:
     import torchaudio
 except Exception:
     torchaudio = None
+
+try:
+    import imageio_ffmpeg
+except Exception:
+    imageio_ffmpeg = None
 
 SAMPLE_RATE = 16000
 MODEL_SIZE = "small"
@@ -101,11 +108,60 @@ def decode_audio_blob(blob: bytes) -> tuple[np.ndarray, int]:
         return np.asarray(audio), int(sr)
     except Exception as sf_error:
         if torchaudio is None:
-            raise sf_error
-        tensor, sr = torchaudio.load(io.BytesIO(blob))
-        # torchaudio shape: [channels, time] -> [time, channels]
-        audio = tensor.numpy().T.astype("float32")
-        return audio, int(sr)
+            torchaudio_error = sf_error
+        else:
+            try:
+                tensor, sr = torchaudio.load(io.BytesIO(blob))
+                # torchaudio shape: [channels, time] -> [time, channels]
+                audio = tensor.numpy().T.astype("float32")
+                return audio, int(sr)
+            except Exception as e:
+                torchaudio_error = e
+
+        ffmpeg_bin = shutil.which("ffmpeg")
+        if ffmpeg_bin is None and imageio_ffmpeg is not None:
+            try:
+                ffmpeg_bin = imageio_ffmpeg.get_ffmpeg_exe()
+            except Exception:
+                ffmpeg_bin = None
+        if not ffmpeg_bin:
+            raise RuntimeError(
+                f"Audio decode failed (soundfile={sf_error}, torchaudio={torchaudio_error}). "
+                "Install ffmpeg (or imageio-ffmpeg) or send WAV/PCM."
+            )
+
+        # Decode arbitrary container/codec (e.g. MediaRecorder webm/opus) to mono 16k float32.
+        proc = subprocess.run(
+            [
+                ffmpeg_bin,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                "pipe:0",
+                "-f",
+                "f32le",
+                "-ac",
+                "1",
+                "-ar",
+                str(SAMPLE_RATE),
+                "pipe:1",
+            ],
+            input=blob,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        if proc.returncode != 0 or not proc.stdout:
+            err = proc.stderr.decode("utf-8", errors="ignore").strip()[:400]
+            raise RuntimeError(
+                f"Audio decode failed (soundfile={sf_error}, torchaudio={torchaudio_error}, ffmpeg={err or 'no output'})."
+            )
+
+        pcm = np.frombuffer(proc.stdout, dtype=np.float32)
+        if pcm.size == 0:
+            raise RuntimeError("Audio decode failed: ffmpeg produced empty output.")
+        return pcm, SAMPLE_RATE
 
 
 def decode_chunk_to_pcm16k(chunk: bytes) -> np.ndarray:
