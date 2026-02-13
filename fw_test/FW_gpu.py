@@ -15,6 +15,11 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, W
 from faster_whisper import WhisperModel
 from silero_vad import get_speech_timestamps, load_silero_vad
 
+try:
+    import torchaudio
+except Exception:
+    torchaudio = None
+
 SAMPLE_RATE = 16000
 MODEL_SIZE = "small"
 COMPUTE_TYPE = os.getenv("FW_COMPUTE_TYPE", "float16")
@@ -27,8 +32,8 @@ VAD_THRESHOLD = float(os.getenv("FW_VAD_THRESHOLD", "0.45"))
 VAD_MIN_SPEECH_MS = int(os.getenv("FW_VAD_MIN_SPEECH_MS", "80"))
 VAD_MIN_SILENCE_MS = int(os.getenv("FW_VAD_MIN_SILENCE_MS", "500"))
 MIN_AUDIO_SEC = float(os.getenv("FW_MIN_AUDIO_SEC", "0.20"))
-PARTIAL_INTERVAL_SEC = float(os.getenv("FW_PARTIAL_INTERVAL_SEC", "0.8"))
-MAX_SEGMENT_SEC = float(os.getenv("FW_MAX_SEGMENT_SEC", "2.0"))
+WS_PARTIAL_INTERVAL_SEC = float(os.getenv("FW_WS_PARTIAL_INTERVAL_SEC", "2.0"))
+WS_MIN_PARTIAL_CHUNKS = int(os.getenv("FW_WS_MIN_PARTIAL_CHUNKS", "2"))
 
 
 def parse_cuda_devices(raw: str) -> list[int]:
@@ -90,13 +95,17 @@ def preprocess_audio(audio: np.ndarray, sr: int) -> np.ndarray:
     return out.astype("float32")
 
 
-def preprocess_pcm16_mono(chunk: bytes) -> np.ndarray:
-    if not chunk:
-        return np.array([], dtype="float32")
-    pcm = np.frombuffer(chunk, dtype=np.int16)
-    if len(pcm) == 0:
-        return np.array([], dtype="float32")
-    return (pcm.astype("float32") / 32768.0).clip(-1.0, 1.0)
+def decode_audio_blob(blob: bytes) -> tuple[np.ndarray, int]:
+    try:
+        audio, sr = sf.read(io.BytesIO(blob), dtype="float32", always_2d=False)
+        return np.asarray(audio), int(sr)
+    except Exception as sf_error:
+        if torchaudio is None:
+            raise sf_error
+        tensor, sr = torchaudio.load(io.BytesIO(blob))
+        # torchaudio shape: [channels, time] -> [time, channels]
+        audio = tensor.numpy().T.astype("float32")
+        return audio, int(sr)
 
 
 @dataclass
@@ -211,6 +220,33 @@ def worker_loop(worker_id: int, device_index: int) -> None:
             job_queue.task_done()
 
 
+def build_livekit_style_payload(result: dict[str, Any]) -> dict[str, Any]:
+    text = (result.get("text") or "").strip()
+    segments = result.get("segments") or []
+    lines = []
+    for seg in segments:
+        seg_text = (seg.get("text") or "").strip()
+        if not seg_text:
+            continue
+        lines.append(
+            {
+                "speaker": 1,
+                "start": float(seg.get("start", 0.0)),
+                "end": float(seg.get("end", 0.0)),
+                "text": seg_text,
+            }
+        )
+
+    return {
+        "status": "active_transcription" if text else "no_audio_detected",
+        "buffer_transcription": text,
+        "lines": lines,
+        "language": result.get("language", "ko"),
+        "worker_id": result.get("worker_id"),
+        "device_index": result.get("device_index"),
+    }
+
+
 def start_workers_once() -> None:
     global workers_started
     if workers_started:
@@ -277,7 +313,7 @@ async def transcribe(
         raise HTTPException(status_code=400, detail="Empty audio file.")
 
     try:
-        audio, sr = sf.read(io.BytesIO(blob), dtype="float32", always_2d=False)
+        audio, sr = decode_audio_blob(blob)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to decode audio: {e}") from e
 
@@ -288,21 +324,40 @@ async def transcribe(
     return await submit_job(processed, language)
 
 
-@app.websocket("/ws/transcribe")
-async def ws_transcribe(websocket: WebSocket) -> None:
+@app.websocket("/asr")
+async def asr_websocket(websocket: WebSocket) -> None:
+    # WLK-like websocket endpoint for SSCore proxy compatibility.
     await websocket.accept()
-    await websocket.send_json(
-        {
-            "status": "ready",
-            "type": "info",
-            "sample_rate": SAMPLE_RATE,
-            "format": "pcm_s16le_mono",
-        }
-    )
-
     language = "ko"
-    buffer: list[np.ndarray] = []
-    last_partial_at = time.time()
+    chunks: list[bytes] = []
+    last_partial_at = 0.0
+
+    async def emit_result(is_final: bool = False) -> None:
+        if not chunks:
+            if is_final:
+                await websocket.send_json(
+                    {"status": "no_audio_detected", "buffer_transcription": "", "lines": []}
+                )
+            return
+
+        blob = b"".join(chunks)
+        try:
+            audio, sr = decode_audio_blob(blob)
+        except Exception:
+            # Stream chunks may be temporarily undecodable; wait for more data.
+            if is_final:
+                await websocket.send_json(
+                    {"status": "no_audio_detected", "buffer_transcription": "", "lines": []}
+                )
+            return
+
+        processed = preprocess_audio(np.asarray(audio), int(sr))
+        if len(processed) == 0:
+            await websocket.send_json({"status": "no_audio_detected", "buffer_transcription": "", "lines": []})
+            return
+
+        result = await submit_job(processed, language)
+        await websocket.send_json(build_livekit_style_payload(result))
 
     try:
         while True:
@@ -315,62 +370,23 @@ async def ws_transcribe(websocket: WebSocket) -> None:
                 cmd = text_data.strip().lower()
                 if cmd.startswith("lang:"):
                     language = cmd.split(":", 1)[1].strip() or "ko"
-                    await websocket.send_json({"status": "ok", "type": "config", "language": language})
-                    continue
-                if cmd in ("flush", "final"):
-                    if not buffer:
-                        await websocket.send_json({"status": "listening", "type": "silence", "text": ""})
-                        continue
-                    audio = np.concatenate(buffer).astype("float32")
-                    buffer.clear()
-                    result = await submit_job(audio, language)
-                    await websocket.send_json(
-                        {
-                            "status": "completed",
-                            "type": "final",
-                            "text": result.get("text", ""),
-                            "segments": result.get("segments", []),
-                            "worker_id": result.get("worker_id"),
-                            "device_index": result.get("device_index"),
-                        }
-                    )
-                    last_partial_at = time.time()
-                    continue
-                if cmd in ("stop", "close"):
-                    await websocket.close()
-                    break
+                continue
 
             bytes_data = message.get("bytes")
-            if bytes_data:
-                chunk = preprocess_pcm16_mono(bytes_data)
-                if len(chunk) == 0:
-                    continue
-                buffer.append(chunk)
+            if bytes_data is None:
+                continue
 
-                buffered_sec = sum(len(x) for x in buffer) / SAMPLE_RATE
-                now = time.time()
-                should_partial = buffered_sec >= MIN_AUDIO_SEC and (now - last_partial_at) >= PARTIAL_INTERVAL_SEC
-                should_force = buffered_sec >= MAX_SEGMENT_SEC
-                if not (should_partial or should_force):
-                    continue
+            # SSCore/MediaRecorder 종료 신호(빈 바이너리): 최종 전사 후 버퍼 초기화.
+            if len(bytes_data) == 0:
+                await emit_result(is_final=True)
+                chunks.clear()
+                await websocket.send_json({"type": "ready_to_stop"})
+                continue
 
-                audio = np.concatenate(buffer).astype("float32")
-                buffer.clear()
-                result = await submit_job(audio, language)
-                text = result.get("text", "")
-                if text:
-                    await websocket.send_json(
-                        {
-                            "status": "streaming",
-                            "type": "partial",
-                            "text": text,
-                            "segments": result.get("segments", []),
-                            "worker_id": result.get("worker_id"),
-                            "device_index": result.get("device_index"),
-                        }
-                    )
-                else:
-                    await websocket.send_json({"status": "listening", "type": "silence", "text": ""})
+            chunks.append(bytes_data)
+            now = time.time()
+            if len(chunks) >= WS_MIN_PARTIAL_CHUNKS and (now - last_partial_at) >= WS_PARTIAL_INTERVAL_SEC:
+                await emit_result(is_final=False)
                 last_partial_at = now
     except WebSocketDisconnect:
         pass
