@@ -28,11 +28,11 @@ except Exception:
     imageio_ffmpeg = None
 
 SAMPLE_RATE = 16000
-MODEL_SIZE = "small"
+MODEL_SIZE = "medium"
 COMPUTE_TYPE = os.getenv("FW_COMPUTE_TYPE", "float16")
 CUDA_DEVICES = os.getenv("CUDA_DEVICES", "0")
-WORKERS_PER_DEVICE = int(os.getenv("FW_WORKERS_PER_DEVICE", "4"))
-TOTAL_WORKERS = int(os.getenv("FW_TOTAL_WORKERS", "0"))
+WORKERS_PER_DEVICE = int(os.getenv("FW_WORKERS_PER_DEVICE", "2"))
+TOTAL_WORKERS = int(os.getenv("FW_TOTAL_WORKERS", "2"))
 QUEUE_MAXSIZE = int(os.getenv("FW_QUEUE_MAXSIZE", "128"))
 
 VAD_THRESHOLD = float(os.getenv("FW_VAD_THRESHOLD", "0.45"))
@@ -468,6 +468,10 @@ async def asr_websocket(websocket: WebSocket) -> None:
             now = time.time()
             if len(raw_chunks) >= WS_MIN_PARTIAL_CHUNKS and (now - last_partial_at) >= WS_PARTIAL_INTERVAL_SEC:
                 await emit_result(is_final=False)
+                # Partial was sent, so reset buffers to avoid repeated full-context retranscription.
+                raw_chunks.clear()
+                pcm_chunks.clear()
+                decode_fail_count = 0
                 last_partial_at = now
     except WebSocketDisconnect:
         pass
