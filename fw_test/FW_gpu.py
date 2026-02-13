@@ -308,6 +308,15 @@ def build_livekit_style_payload(result: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def log_transcript(source: str, payload: dict[str, Any]) -> None:
+    text = (payload.get("text") or payload.get("buffer_transcription") or "").strip()
+    if not text:
+        return
+    worker = payload.get("worker_id")
+    device = payload.get("device_index")
+    print(f"[{source}] worker={worker} gpu={device} text={text}", flush=True)
+
+
 def start_workers_once() -> None:
     global workers_started
     if workers_started:
@@ -382,7 +391,9 @@ async def transcribe(
     if len(processed) == 0:
         raise HTTPException(status_code=400, detail="Audio has no usable samples.")
 
-    return await submit_job(processed, language)
+    result = await submit_job(processed, language)
+    log_transcript("http/transcribe", result)
+    return result
 
 
 @app.websocket("/asr")
@@ -427,7 +438,9 @@ async def asr_websocket(websocket: WebSocket) -> None:
             return
 
         result = await submit_job(processed, language)
-        await websocket.send_json(build_livekit_style_payload(result))
+        payload = build_livekit_style_payload(result)
+        log_transcript("ws/asr", payload)
+        await websocket.send_json(payload)
 
     try:
         while True:
