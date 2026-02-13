@@ -108,6 +108,11 @@ def decode_audio_blob(blob: bytes) -> tuple[np.ndarray, int]:
         return audio, int(sr)
 
 
+def decode_chunk_to_pcm16k(chunk: bytes) -> np.ndarray:
+    audio, sr = decode_audio_blob(chunk)
+    return preprocess_audio(np.asarray(audio), int(sr))
+
+
 @dataclass
 class Job:
     job_id: str
@@ -329,29 +334,38 @@ async def asr_websocket(websocket: WebSocket) -> None:
     # WLK-like websocket endpoint for SSCore proxy compatibility.
     await websocket.accept()
     language = "ko"
-    chunks: list[bytes] = []
+    raw_chunks: list[bytes] = []
+    pcm_chunks: list[np.ndarray] = []
     last_partial_at = 0.0
+    decode_fail_count = 0
 
     async def emit_result(is_final: bool = False) -> None:
-        if not chunks:
+        if not raw_chunks:
             if is_final:
                 await websocket.send_json(
                     {"status": "no_audio_detected", "buffer_transcription": "", "lines": []}
                 )
             return
 
-        blob = b"".join(chunks)
-        try:
-            audio, sr = decode_audio_blob(blob)
-        except Exception:
-            # Stream chunks may be temporarily undecodable; wait for more data.
-            if is_final:
-                await websocket.send_json(
-                    {"status": "no_audio_detected", "buffer_transcription": "", "lines": []}
-                )
-            return
+        processed = (
+            np.concatenate(pcm_chunks).astype("float32")
+            if pcm_chunks
+            else np.array([], dtype="float32")
+        )
 
-        processed = preprocess_audio(np.asarray(audio), int(sr))
+        # Fallback path: if per-chunk decode was not available, try full-blob decode once.
+        if len(processed) == 0:
+            blob = b"".join(raw_chunks)
+            try:
+                audio, sr = decode_audio_blob(blob)
+                processed = preprocess_audio(np.asarray(audio), int(sr))
+            except Exception:
+                if is_final:
+                    await websocket.send_json(
+                        {"status": "no_audio_detected", "buffer_transcription": "", "lines": []}
+                    )
+                return
+
         if len(processed) == 0:
             await websocket.send_json({"status": "no_audio_detected", "buffer_transcription": "", "lines": []})
             return
@@ -379,13 +393,24 @@ async def asr_websocket(websocket: WebSocket) -> None:
             # SSCore/MediaRecorder 종료 신호(빈 바이너리): 최종 전사 후 버퍼 초기화.
             if len(bytes_data) == 0:
                 await emit_result(is_final=True)
-                chunks.clear()
+                raw_chunks.clear()
+                pcm_chunks.clear()
+                decode_fail_count = 0
                 await websocket.send_json({"type": "ready_to_stop"})
                 continue
 
-            chunks.append(bytes_data)
+            raw_chunks.append(bytes_data)
+            try:
+                pcm = decode_chunk_to_pcm16k(bytes_data)
+                if len(pcm) > 0:
+                    pcm_chunks.append(pcm)
+            except Exception as e:
+                decode_fail_count += 1
+                if decode_fail_count <= 3 or decode_fail_count % 20 == 0:
+                    print(f"[ws/asr] chunk decode failed ({decode_fail_count}): {e}", flush=True)
+
             now = time.time()
-            if len(chunks) >= WS_MIN_PARTIAL_CHUNKS and (now - last_partial_at) >= WS_PARTIAL_INTERVAL_SEC:
+            if len(raw_chunks) >= WS_MIN_PARTIAL_CHUNKS and (now - last_partial_at) >= WS_PARTIAL_INTERVAL_SEC:
                 await emit_result(is_final=False)
                 last_partial_at = now
     except WebSocketDisconnect:
